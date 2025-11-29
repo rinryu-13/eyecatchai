@@ -3,15 +3,40 @@
 # CPUサーバー上で ver0 LoRA を使ってアイキャッチ画像を生成するスクリプト
 # - ベース: runwayml/stable-diffusion-v1-5
 # - LoRA : models/lora_ver0_fp16.safetensors
+# - アスペクト比: 16:9 固定（横長）
 # ----------------------------------------
 
 import argparse
 from pathlib import Path
 import os
 import traceback
+from typing import Tuple
 
 import torch
 from diffusers import StableDiffusionPipeline
+
+
+def calc_16_9_size(short_side: int) -> Tuple[int, int]:
+    """
+    16:9 横長の解像度を計算する。
+    short_side は「短辺（高さ）」のピクセル数を想定。
+    Stable Diffusion の制約に合わせて 8 の倍数に丸める。
+    """
+    if short_side < 64:
+        short_side = 64
+
+    # 高さ（短辺）を 8 の倍数に丸める
+    height = (short_side // 8) * 8
+    if height == 0:
+        height = 64
+
+    # 幅（長辺） = 高さ * 16 / 9 を 8 の倍数に丸める
+    width_float = height * 16.0 / 9.0
+    width = int(width_float // 8) * 8
+    if width < 64:
+        width = 64
+
+    return width, height
 
 
 def load_pipeline(base_model_id: str, lora_path: Path, device: str = "cpu") -> StableDiffusionPipeline:
@@ -25,7 +50,7 @@ def load_pipeline(base_model_id: str, lora_path: Path, device: str = "cpu") -> S
     pipe = StableDiffusionPipeline.from_pretrained(
         base_model_id,
         torch_dtype=torch.float32,
-        safety_checker=None,  # 公開サービスにする場合は True/独自フィルタを検討
+        safety_checker=None,  # 公開サービスにする場合は safety checker の利用を検討
     )
 
     # メモリ節約オプション（あれば有効化）
@@ -60,13 +85,14 @@ def generate_image(
     seed: int = 42,
     num_inference_steps: int = 30,
     guidance_scale: float = 7.5,
-    width: int = 512,
+    width: int = 912,
     height: int = 512,
     device: str = "cpu",
 ) -> None:
     """
     1枚だけ画像を生成して保存する。
-    CPU サーバー前提。メモリ不足が発生した場合は解像度や steps を下げる。
+    CPU サーバー前提。
+    width / height は 16:9 を想定。
     """
     project_root = Path(__file__).resolve().parent
     models_dir = project_root / "models"
@@ -82,7 +108,7 @@ def generate_image(
     os.makedirs(output_path.parent, exist_ok=True)
 
     print("[INFO] 画像生成を開始します...")
-    print(f"[INFO] 解像度: {width}x{height}, steps: {num_inference_steps}, guidance: {guidance_scale}")
+    print(f"[INFO] 解像度(16:9): {width}x{height}, steps: {num_inference_steps}, guidance: {guidance_scale}")
     print("[INFO] 出力先:", output_path)
 
     # 実際の生成処理
@@ -103,7 +129,7 @@ def generate_image(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="ver0 LoRA を使って記事アイキャッチ画像を生成するスクリプト（CPUサーバー用）"
+        description="ver0 LoRA を使って記事アイキャッチ画像を生成するスクリプト（CPUサーバー用, 16:9 固定）"
     )
     parser.add_argument(
         "--prompt",
@@ -139,16 +165,10 @@ def main() -> None:
         help="ガイダンススケール（プロンプトの反映の強さ）",
     )
     parser.add_argument(
-        "--width",
-        type=int,
-        default=512,  # 本番用のデフォルト解像度
-        help="生成画像の横幅（既定: 512）",
-    )
-    parser.add_argument(
-        "--height",
+        "--short_side",
         type=int,
         default=512,
-        help="生成画像の高さ（既定: 512）",
+        help="16:9 画像の短辺（高さ）のピクセル数。横幅は自動計算されます。（例: 512）",
     )
     parser.add_argument(
         "--device",
@@ -167,10 +187,14 @@ def main() -> None:
             "明るい, 清潔感, ブログ用イラスト, 日本語テキスト入り"
         )
 
+    # 16:9 の解像度を自動計算
+    width, height = calc_16_9_size(args.short_side)
+
     output_path = Path(args.output).resolve()
 
     print("[INFO] generate_ver0.py を開始します")
     print("[INFO] 使用デバイス:", args.device)
+    print(f"[INFO] 16:9 解像度に自動設定: {width}x{height} (short_side={args.short_side})")
 
     generate_image(
         prompt=args.prompt,
@@ -179,8 +203,8 @@ def main() -> None:
         seed=args.seed,
         num_inference_steps=args.steps,
         guidance_scale=args.guidance,
-        width=args.width,
-        height=args.height,
+        width=width,
+        height=height,
         device=args.device,
     )
 
@@ -197,7 +221,7 @@ if __name__ == "__main__":
         if "DefaultCPUAllocator" in msg or "not enough memory" in msg:
             print("[HINT] CPU メモリ不足の可能性があります。以下を試してください:")
             print("  - VPS のメモリサイズを増やすプランに変更する")
-            print("  - --width と --height を 384 や 320 に下げて再実行する")
+            print("  - --short_side を 432 や 384 に下げて再実行する")
             print("  - --steps を 20 や 15 に下げる")
         traceback.print_exc()
     except Exception as e:
