@@ -1,0 +1,6 @@
+torch
+diffusers>=0.25.0
+safetensors
+transformers
+accelerate
+Pillow
