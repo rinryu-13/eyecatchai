@@ -5,7 +5,7 @@
 # - LoRA     : models/lora_ver1_fp16.safetensors
 # - 解像度   : 完全固定 16:9（912 x 512）
 # - CPU向け最適化（メモリ節約・速度改善）
-# - LoRA が確実に適用される最新版コード
+# - LoRA が確実に適用されるように二段構えで読み込み
 # ----------------------------------------
 
 import argparse
@@ -15,6 +15,7 @@ import traceback
 
 import torch
 from diffusers import StableDiffusionPipeline
+from diffusers.models.attention_processor import LoRAAttnProcessor
 
 
 # -----------------------------------------------------
@@ -39,21 +40,58 @@ def load_pipeline(base_model_id: str, lora_path: Path, device: str = "cpu") -> S
         print("[INFO] vae_slicing を有効化しました")
 
     # -------------------------------------------------
-    # 🔥 LoRA 読み込み（最新版の安定動作）
+    # 🔥 LoRA 読み込み（attn_procs / adapter の両方を試す）
     # -------------------------------------------------
+    has_lora = False
+
     if lora_path.is_file():
         print("[INFO] LoRA を読み込み中:", lora_path)
 
-        pipe.load_lora_weights(str(lora_path))
+        # ① diffusers の attn_procs 形式を試す
+        try:
+            pipe.unet.load_attn_procs(str(lora_path))
+            has_lora = any(
+                isinstance(p, LoRAAttnProcessor)
+                for p in pipe.unet.attn_processors.values()
+            )
+            print(f"[DEBUG] load_attn_procs 後 Has LoRAAttnProcessor?: {has_lora}")
+        except Exception as e:
+            print("[WARN] unet.load_attn_procs に失敗:", repr(e))
 
-        # diffusers ≥ 0.24 は fuse_lora が必要
-        if hasattr(pipe, "fuse_lora"):
-            print("[INFO] fuse_lora を実行（LoRA をモデルに統合）")
-            pipe.fuse_lora()
-            print("[INFO] LoRA 統合完了（ver1 有効化）")
+        # ② まだ刺さっていない場合は adapter 形式を試す
+        if not has_lora:
+            try:
+                pipe.load_lora_weights(str(lora_path))
+                has_lora = any(
+                    isinstance(p, LoRAAttnProcessor)
+                    for p in pipe.unet.attn_processors.values()
+                )
+                print(f"[DEBUG] load_lora_weights 後 Has LoRAAttnProcessor?: {has_lora}")
+            except Exception as e:
+                print("[WARN] pipe.load_lora_weights に失敗:", repr(e))
 
+        if has_lora:
+            # diffusers ≥ 0.24 系なら fuse_lora で統合可能
+            if hasattr(pipe, "fuse_lora"):
+                try:
+                    print("[INFO] fuse_lora を実行（LoRA をモデルに統合）")
+                    pipe.fuse_lora()
+                    print("[INFO] LoRA 統合完了（ver1 有効化）")
+                except Exception as e:
+                    # fuse に失敗しても、動的 LoRA としては効いているので致命傷ではない
+                    print("[WARN] fuse_lora は失敗しましたが、LoRA 自体は適用済みの可能性があります:", repr(e))
+        else:
+            print("[WARN] LoRA(ver1) を読み込みましたが、LoRAAttnProcessor が見つかりませんでした。")
+            print("       → ver1 の学習結果が効いていない可能性があります。")
     else:
         print("[WARN] LoRA(ver1) が見つからなかったため、素のSD1.5で生成します")
+
+    # 最終的な確認
+    final_has_lora = any(
+        isinstance(p, LoRAAttnProcessor)
+        for p in pipe.unet.attn_processors.values()
+    )
+    print(f"[CHECK] 最終的な Has LoRAAttnProcessor?: {final_has_lora}")
 
     pipe.to(device)
     return pipe
@@ -67,8 +105,8 @@ def generate_image(
     negative_prompt: str,
     output_path: Path,
     seed: int = 42,
-    num_inference_steps: int = 30,
-    guidance_scale: float = 7.5,
+    num_inference_steps: int = 24,   # ← CPUなので 30 → 24 に少しだけ短縮（必要なら 20〜15 まで下げてもOK）
+    guidance_scale: float = 7.0,     # 少しだけ下げて収束を早める
     device: str = "cpu",
 ) -> None:
 
@@ -91,6 +129,8 @@ def generate_image(
     print(f"       guidance: {guidance_scale}")
     print(f"       LoRA: lora_ver1_fp16.safetensors")
 
+    # CPU なので grad 無効 & Inference Mode
+    torch.set_grad_enabled(False)
     with torch.inference_mode():
         result = pipe(
             prompt=prompt,
@@ -127,8 +167,8 @@ def main() -> None:
 
     parser.add_argument("--output", default="./output/ver1_sample.png")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--steps", type=int, default=30)
-    parser.add_argument("--guidance", type=float, default=7.5)
+    parser.add_argument("--steps", type=int, default=24)   # デフォルトも 24 に寄せる
+    parser.add_argument("--guidance", type=float, default=7.0)
     parser.add_argument("--device", type=str, default="cpu", choices=["cpu"])
 
     args = parser.parse_args()
